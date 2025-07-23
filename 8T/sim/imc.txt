@@ -1,0 +1,7 @@
+rtl/imc_sram.v
+rtl/accumulator.v
+rtl/column_decoder.v
+rtl/control_fsm.v
+rtl/imc_defs.vh
+rtl/row_decoder.v
+rtl/xnor_compute.v
