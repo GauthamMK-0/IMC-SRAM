@@ -1,0 +1,19 @@
+# Verilator build output
+obj_dir/
+
+# Waveform dumps
+*.vcd
+*.fst
+*.lxt
+*.lxt2
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
