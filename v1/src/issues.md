@@ -1,207 +1,70 @@
-# IMC-SRAM Design Issues & Challenges Log
+# IMC-SRAM Design & Implementation Notes
 
-> A record of problems encountered, root causes identified, and solutions applied
-> during the design and simulation of an In-Memory Computing SRAM macro.
-> Useful for technical interviews to demonstrate debugging methodology and
-> understanding of hardware design trade-offs.
+This document logs technical challenges identified during the development of the IMC-SRAM macro and the corresponding solutions.
 
 ---
 
-## Issue #1 — Output Data Lost After FSM State Transition
+## 1. Output Stability and FSM Timing
 
-**Symptom:** Read-back of SRAM rows returned all zeros. MAC compute results
-were always zero. The FSM reported `result_valid` but output buses were empty.
+**Problem:** Read-back and MAC results were observed as zero in simulation, even when internal signals showed active computation.
 
-**Root Cause:** Classic **combinational output vs. registered FSM** timing
-problem. The controller FSM asserted `sram_rd_en` and `compute_en` during
-their respective active states (S_READ, S_COMPUTE/S_ADC). However, these
-enables were deasserted when the FSM transitioned to S_DONE. Since the SRAM
-read mux and ADC outputs were purely combinational and gated by these enables,
-the data disappeared before the testbench could sample it at `result_valid`.
+**Root Cause:** The controller FSM was deasserting enable signals (`sram_rd_en`, `compute_en`) exactly when transitioning to the `DONE` state. Since the output logic was purely combinational and gated by these enables, the valid data was lost before it could be sampled by the testbench.
 
-**Solution:** Added **output holding registers** in `imc_top.v`:
-```verilog
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        read_data  <= 0;
-        mac_result <= 0;
-    end else begin
-        if (sram_rd_en)  read_data  <= sram_rd_data;  // Latch during READ
-        if (adc_en)      mac_result <= adc_out;        // Latch during ADC
-    end
-end
-```
-
-**Interview talking point:** *"This is a common pitfall in FSM-driven
-datapaths — you need to decide whether outputs are registered or
-combinational. Registered outputs add one cycle of latency but guarantee
-stable data at the consumer. In our case, the FSM's DONE state needed
-stable data, so we latched during the active computation phase."*
+**Solution:** Implemented output registers in the top-level module to latch results during their active phases. This ensures data remains stable and valid when the FSM asserts the `result_valid` flag.
 
 ---
 
-## Issue #2 — Signed vs. Unsigned Arithmetic in MAC Engine
+## 2. Signed Arithmetic in MAC Engine
 
-**Symptom:** Early MAC results had wrong magnitudes — some columns showed
-positive values where negatives were expected.
+**Problem:** MAC results showed incorrect magnitudes and signs during varied input tests.
 
-**Root Cause:** The IMC operation maps stored weight bits {0, 1} to signed
-multiplier values {−1, +1}. The DAC input levels are unsigned (0 to 7). When
-computing `sign(weight) × input_level`, care must be taken to properly
-sign-extend the unsigned DAC level before negation. Without explicit
-`$signed()` casting and zero-extension to the accumulator width, Verilog
-treats the negation as unsigned, causing wrap-around instead of true negation.
+**Root Cause:** The design maps binary weights {0, 1} to signed values {−1, +1} for multiplication with unsigned DAC levels (0–7). Verilog's default behavior for negation on unsigned types leads to wrap-around rather than true signed negation.
 
-**Solution:** Explicit sign-extension and `$signed()` casting:
-```verilog
-if (w_bit)
-    product = $signed({{(MAC_ACC_W - DAC_BITS){1'b0}}, x_level});
-else
-    product = -$signed({{(MAC_ACC_W - DAC_BITS){1'b0}}, x_level});
-```
-
-**Interview talking point:** *"In IMC, the SRAM stores binary weights but the
-analog computation effectively produces signed currents. Translating this into
-RTL requires careful handling of the {0,1} → {−1,+1} mapping. I had to
-zero-extend the unsigned DAC code to the full accumulator width, then apply
-`$signed()` before negation to avoid unsigned wrap-around — a subtle but
-critical detail for correctness."*
+**Solution:** Explicitly cast signals using `$signed()` and ensured proper bit-extension to the accumulator width before performing arithmetic operations. This ensures the logic correctly handles the signed multiplication requirement.
 
 ---
 
-## Issue #3 — Verilator Latch Inference Warnings in MAC Engine
+## 3. Latch Inference in Combinational Logic
 
-**Symptom:** Verilator issued `%Warning-LATCH` for intermediate variables
-(`w_bit`, `x_level`, `product`, `col_result`) inside the MAC engine's
-combinational `always @(*)` block.
+**Problem:** The simulator issued warnings regarding inferred latches in the MAC engine.
 
-**Root Cause:** When `compute_en = 0`, the `else` branch only sets `acc = 0`
-but does not explicitly assign the intermediate variables `w_bit`, `x_level`,
-and `product`. Verilator detects that these variables are not assigned on all
-control paths, inferring unwanted latches.
+**Root Cause:** Within the combinational `always @(*)` block, some intermediate variables were not assigned a value in all possible execution paths (specifically when `compute_en` was low). 
 
-**Why it was accepted:** In this behavioral/research model, the intermediate
-variables are only meaningful when `compute_en = 1`. The output (`col_result`)
-is correctly assigned to zero when disabled. The latched intermediates have no
-effect on functional correctness. Adding default assignments would clutter the
-code without benefit.
-
-**Interview talking point:** *"Verilator is stricter than synthesis tools about
-latch inference — it warns even for intermediate variables that don't affect
-outputs. In a research simulation model, I chose readability over warning
-suppression. In a production RTL, I would add default assignments or use
-`/* verilator lint_off LATCH */` with a comment explaining the rationale."*
+**Solution:** While these latches do not affect the functional correctness of the behavioral model, future iterations should include default assignments at the start of the block to ensure a fully combinational implementation that meets standard linting requirements.
 
 ---
 
-## Issue #4 — Modeling Analog Behavior in a Pure Digital Simulator
+## 4. Digital Modeling of Analog Behavior
 
-**Symptom / Challenge:** The reference paper uses SystemVerilog `real` types,
-User-Defined Nettypes (UDNs), and resolution functions to model analog
-currents on bit lines. Verilator does not support `real` nets, UDNs, or
-resolution functions.
+**Challenge:** The reference architecture relies on analog bit-line current summation, which is difficult to represent in a standard digital simulator.
 
-**Root Cause:** Verilator is a cycle-based digital simulator — it has no
-concept of analog signal resolution, continuous current flow, or intermediate
-voltage biasing.
+**Approach:** Translated analog concepts into digital equivalents:
+- **DAC:** Modeled as an integer level (0–7).
+- **Bit-line Summation:** Implemented as a signed integer dot product.
+- **ADC:** Modeled as a quantization/saturation stage.
 
-**Solution:** Replaced the analog modeling approach with a **digital
-behavioral equivalent**:
-
-| Paper (Analog Model)          | Our Design (Digital Model)         |
-|-------------------------------|------------------------------------|
-| DAC → analog voltage on WL    | DAC → integer level (0–7)          |
-| Bit cell leakage ∝ V_WL × w  | `product = sign(w) × level`        |
-| Bit-line current summation    | `acc += product` in a for-loop     |
-| ADC → digital readout         | Direct integer pass-through        |
-| EEnet (current resolution)    | Packed vector bus                  |
-
-**Interview talking point:** *"The key insight is that IMC's analog
-computation — current-mode multiplication and charge-domain accumulation — is
-mathematically equivalent to a signed integer dot product. By modeling at the
-functional level rather than the circuit level, we can verify the algorithm
-and control logic at digital simulation speed while preserving the
-architectural intent. This is the Real Number Modeling (RNM) philosophy from
-the paper, adapted for open-source tools."*
+This functional modeling approach allows for architectural verification while maintaining compatibility with digital simulation tools.
 
 ---
 
-## Issue #5 — SRAM Array Read Port Contention
+## 5. Memory Port Contention
 
-**Symptom:** When multiple word lines were asserted for read simultaneously,
-the output was the OR of multiple rows instead of a single row's data.
+**Problem:** Potential data corruption or incorrect readouts if multiple word lines are active during a standard read operation.
 
-**Root Cause:** The read mux in `imc_sram_array.v` iterates through all rows
-and overwrites `rd_mux` whenever a word line is active. If multiple word lines
-are high, the last active row wins (priority encoding), but intermediate
-iterations cause unintended values.
-
-**Solution:** Ensured the controller only asserts one read word line at a time
-(one-hot encoding via row decoder). For compute mode, the read port is unused
-— the full weight matrix is exposed via the dedicated `weight_out` bus.
-
-**Interview talking point:** *"In real SRAM, asserting multiple word lines
-simultaneously for read causes bit-line contention and can corrupt data. Our
-digital model correctly separates the read port (one-hot, single-row) from
-the compute port (all rows exposed simultaneously). This mirrors the
-hardware: during normal read, only one WL is driven to VDD; during compute,
-all WLs are driven to intermediate DAC levels."*
+**Solution:** The controller and row decoders ensure one-hot encoding for word lines during standard read/write operations. The "Compute" mode is physically separated in the logic, allowing it to activate all rows simultaneously for MAC operations without interfering with the standard single-row access logic.
 
 ---
 
-## Issue #6 — Accumulator Overflow Risk in MAC Results
+## 6. Accumulator Precision and Overflow
 
-**Symptom:** Not a bug — a design constraint that required careful analysis.
+**Analysis:** With 8 rows and a 3-bit DAC, the per-column sum ranges from −56 to +56. 
 
-**Analysis:** For an 8-row array with 3-bit DAC (levels 0–7):
-- Max per-column sum: `+8 × 7 = +56` (when all weights = 1, all inputs = 7)
-- Min per-column sum: `−8 × 7 = −56` (when all weights = 0, all inputs = 7)
-- Required width: `ceil(log2(56)) + 1 = 7 bits signed`
-- Allocated width: `8 bits signed` (range −128 to +127) ✓ Safe
-
-**Scaling concern:** If the array is scaled to 256 rows with 8-bit DAC:
-- Max sum: `±256 × 255 = ±65280` → needs 17 bits signed
-- This would require a wider accumulator and ADC
-
-**Interview talking point:** *"Accumulator width is a critical design
-parameter in IMC. It must grow as O(log2(ROWS × 2^DAC_BITS)). In real chips,
-this limits the maximum array size or requires intermediate partial-sum
-readouts. Our parameterized design makes this trade-off explicit — changing
-`MAC_ACC_W` in the parameter file propagates through the entire design."*
+**Implementation:** An 8-bit signed accumulator was selected to provide sufficient headroom (range −128 to +127). For larger arrays or higher DAC resolution, the accumulator width must be scaled logarithmically to prevent overflow and maintain calculation accuracy.
 
 ---
 
-## Issue #7 — Column Decoder vs. Parallel Compute (Original Design Flaw)
+## 7. Parallel vs. Serial Architecture
 
-**Context:** The original `8T/` design used a column decoder to iterate
-through columns one-by-one with an XNOR + popcount approach.
+**Decision:** The architecture was designed to process all columns in parallel.
 
-**Problem:** This serializes what should be a massively parallel operation.
-The entire point of IMC is that **all columns compute simultaneously** because
-they share independent bit lines. Iterating through columns one at a time
-negates the throughput advantage of IMC.
-
-**Our fix:** The redesigned `src/` architecture computes all columns in
-parallel — the MAC engine processes the entire weight matrix against the full
-input vector in a single combinational evaluation, matching the true physics
-of simultaneous bit-line current accumulation.
-
-**Interview talking point:** *"The original design missed the fundamental
-parallelism of IMC. In real hardware, current flows on all bit lines
-simultaneously — there's no column 'scanning'. Our redesign reflects this
-by computing all column MACs in a single combinational step, which is both
-architecturally correct and more simulation-efficient."*
-
----
-
-## Summary Table
-
-| #  | Category              | Severity | Status   |
-|----|----------------------|----------|----------|
-| 1  | FSM output timing    | Critical | ✅ Fixed  |
-| 2  | Signed arithmetic    | Critical | ✅ Fixed  |
-| 3  | Latch warnings       | Warning  | ⚠️ Accepted |
-| 4  | Analog-to-digital    | Design   | ✅ Solved |
-| 5  | Read port contention | Moderate | ✅ Fixed  |
-| 6  | Overflow analysis    | Design   | ✅ Analyzed |
-| 7  | Parallelism flaw     | Architecture | ✅ Redesigned |
+**Rationale:** While a serial "scanning" approach is easier to implement, it does not represent the primary advantage of IMC. By computing all column results in a single combinational step, the design accurately reflects the simultaneous current accumulation that occurs on physical bit lines.
